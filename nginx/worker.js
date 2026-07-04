@@ -6,7 +6,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const userAgent = request.headers.get("user-agent") || "";
-    
+    const path = url.pathname; // 提前定义 path，防止鉴权逻辑中报错引用未定义变量
+
     // 1. UA 拦截逻辑 (1:1 复刻 Nginx)
     let isPlayer = true;
     const browserRegex = /Mozilla|Chrome|Safari|Edge|Android/i;
@@ -15,7 +16,7 @@ export default {
       isPlayer = false;
     }
 
-    // 2. 鉴权逻辑 (检查你自己的 Worker 防盗链)
+    // 2. 鉴权逻辑 (检查 Token)
     let token = url.searchParams.get("token");
     if (!token) {
       const cookies = request.headers.get("Cookie") || "";
@@ -23,13 +24,22 @@ export default {
       if (cookieMatch) token = cookieMatch[1];
     }
 
-    // 鉴权失败：直接重定向到 403 页面
-    // 注意：如果你的 stream-link token 恰好也是你唯一放行的凭证，这里校验它即可
-    if (token !== AUTH_TOKEN && path.startsWith("/stream-link") === false) { 
-      // 允许 stream-link 携带动态真实 token 通过，下面会单独处理
-      if (!token) return Response.redirect(ERROR_REDIRECT_URL, 302);
+    // 鉴权放行与拦截判定
+    const isStreamLink = path.startsWith("/stream-link") || path.startsWith("/p/");
+    if (!isStreamLink) {
+      // 针对订阅端和普通的直播集群端口，必须严格验证你的 AUTH_TOKEN
+      if (token !== AUTH_TOKEN) {
+        return Response.redirect(ERROR_REDIRECT_URL, 302);
+      }
+    } else {
+      // 针对 stream-link 业务：如果是播放器发起的 /p/ 视频片段请求，允许无 token 放行
+      // 如果是请求 .m3u 列表，必须在 URL 后面带上官方机器人给的动态 token
+      if (path.endsWith(".m3u") && !token) {
+        return new Response("Missing stream-link token", { status: 403 });
+      }
     }
 
+    // 3. 浏览器访问带 token 时，写 Cookie 并移除 URL 参数防盗链 (1:1 复刻 Nginx)
     if (url.searchParams.has("token") && !isPlayer) {
       const redirectUrl = new URL(request.url);
       redirectUrl.searchParams.delete("token");
@@ -42,7 +52,9 @@ export default {
       });
     }
 
-    const path = url.pathname;
+    // =========================================================================
+    // 4. 路由分发集群
+    // =========================================================================
 
     // ----- 【业务 A：M3U 订阅端完美修复 (对应 Nginx 30000 端口)】 -----
     if (path === "/mytv.m3u") {
@@ -53,21 +65,17 @@ export default {
       text = text.replaceAll('服务器ip', url.host);
       text = text.replaceAll('.m3u8', `.m3u8?token=${AUTH_TOKEN}`);
       text = text.replaceAll('smt3.2.1.php?', `smt3.2.1.php?token=${AUTH_TOKEN}&`);
-      text = text.replaceAll'?u=test', '&u=test');
+      text = text.replaceAll('?u=test', '&u=test'); 
       text = text.replaceAll('?163189', `?163189&token=${AUTH_TOKEN}`);
       
       return cleanHeaders(new Response(text, response));
     }
 
-    // ----- 【业务 B：stream-link 转换 (对应 Nginx 30001 端口 - 动态 Token 修复版)】 -----
-    if (path.startsWith("/stream-link") || path.startsWith("/p/")) {
-      
+    // ----- 【业务 B：stream-link 转换 (对应 Nginx 30001 端口)】 -----
+    if (isStreamLink) {
       // 1. 处理请求 M3U 列表文件
       if (path.endsWith(".m3u")) {
-        // 动态抓取你传给 Worker 的专属机器人 token
-        const botToken = url.searchParams.get("token") || ""; 
-        
-        // 拼接出带真实官方 token 的请求地址
+        const botToken = token || ""; // 使用传入的机器人专属 token
         const targetUrl = `https://www.stream-link.org${path.replace("/stream-link", "")}?token=${botToken}`;
         
         let response = await fetch(targetUrl, {
@@ -79,7 +87,6 @@ export default {
         });
         
         let text = await response.text();
-        // 1:1 复刻 Nginx sub_filter 逻辑：将播放流强行重定向回你的 Worker 代理，同时把你的专属 token 传下去
         text = text.replaceAll('https://', `https://${url.host}/p/https://`);
         return cleanHeaders(new Response(text, response));
       }
@@ -93,7 +100,7 @@ export default {
         const upstreamHost = match[2];
         
         let response = await fetch(upstreamTarget, {
-          redirect: "manual", // 劫持并由边缘节点自己消化 302 重定向
+          redirect: "manual", // 拦截重定向
           headers: {
             "Host": upstreamHost,
             "User-Agent": "TiviMate/5.1.0",
@@ -104,13 +111,13 @@ export default {
         // 处理 301/302 重定向
         if ([301, 302, 307].includes(response.status)) {
           let location = response.headers.get("Location");
-          if (location.startsWith("/")) {
+          if (location && location.startsWith("/")) {
             location = `https://${upstreamHost}${location}`;
           }
           return Response.redirect(`https://${url.host}/p/${location}`, 302);
         }
         
-        // 如果是 M3U8/TXT 文本，进行 sub_filter 替换
+        // 如果是 M3U8 文本，进行 sub_filter 替换
         const contentType = response.headers.get("content-type") || "";
         if (contentType.includes("mpegurl") || contentType.includes("text")) {
           let text = await response.text();
